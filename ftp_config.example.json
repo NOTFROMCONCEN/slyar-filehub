@@ -1,0 +1,24 @@
+{
+  "ftp_port": "2121",
+  "web_port": "8080",
+  "webdav_port": "5005",
+  "enable_ftp": true,
+  "enable_sftp": false,
+  "enable_web": false,
+  "enable_webdav": false,
+  "web_password": "",
+  "web_readonly": false,
+  "max_connections": "100",
+  "username": "yourname",
+  "password": "changeme",
+  "welcome_message": "欢迎访问 Slyar FTPserver!",
+  "goodbye_message": "再见!",
+  "directory": "C:/Users/you/FTPShare",
+  "permissions": {
+    "download": true,
+    "upload": false,
+    "rename": false,
+    "delete": false,
+    "mkdir": false
+  }
+}
