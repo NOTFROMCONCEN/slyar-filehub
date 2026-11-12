@@ -22,7 +22,8 @@ logs/
 # 本地配置（含账户密码，切勿提交；模板见 ftp_config.example.json）
 ftp_config.json
 
-# 本地工具状态
+# 本地工具状态与助手工作区数据（不要提交）
+.workbuddy/
 .kilo/
 .v2c/
 .pytest_cache/
@@ -38,6 +39,19 @@ ftp_config.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 发版构建产物（release/ 下的脚本与模板需要提交，只忽略生成物）
+release/_build/
+release/dist/
+release/staging/
+release/*.zip
+release/*.tar.gz
+release/*.deb
+release/*.rpm
+release/*.exe
+latest.json
+SHA256SUMS
+version.txt
 
 # 临时文件
 *.tmp

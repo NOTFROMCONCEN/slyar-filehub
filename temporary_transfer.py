@@ -7,7 +7,7 @@ import secrets
 import time
 import urllib.parse
 
-from web_server import LOGIN_PAGE, WebFileHandler, safe_join
+from web_server import LOGIN_LIMITER, LOGIN_PAGE, WebFileHandler, safe_join
 
 LOGGER = logging.getLogger("TemporaryTransfer")
 
@@ -85,6 +85,10 @@ class TemporaryTransferHandler(WebFileHandler):
             if not self._authorized():
                 self.send_error_page(401, "需要访问码")
                 return
+            if path == "/api/upload" and not self._origin_allowed():
+                LOGGER.warning("拒绝跨站上传: %s", self.address_string())
+                self.send_error_page(403, "跨站请求被拒绝")
+                return
             if path != "/api/upload":
                 self.send_error_page(404, "Not Found")
                 return
@@ -112,17 +116,32 @@ class TemporaryTransferHandler(WebFileHandler):
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
+            self.close_connection = True
             self.send_redirect("/login?e=1")
             return
         if length <= 0 or length > 4096:
+            self.close_connection = True
             self.send_redirect("/login?e=1")
+            return
+        client_key = (
+            self.client_address[0] if self.client_address else "?", "transfer"
+        )
+        allowed, wait = LOGIN_LIMITER.allowed(client_key)
+        if not allowed:
+            self.close_connection = True
+            LOGGER.warning("临时传输访问码尝试过多: %s", self.address_string())
+            self.serve_login(f"尝试次数过多，请 {wait} 秒后重试")
             return
         fields = urllib.parse.parse_qs(
             self.rfile.read(length).decode("utf-8", "ignore")
         )
         code = (fields.get("password") or [""])[0]
         expected = type(self).auth_password or ""
-        if code and secrets.compare_digest(code, expected):
+        # 必须用 bytes 比较：str 版本遇到非 ASCII 输入会抛 TypeError 变成 500
+        if code and secrets.compare_digest(
+            code.encode("utf-8"), expected.encode("utf-8")
+        ):
+            LOGIN_LIMITER.record_success(client_key)
             max_age = max(1, int(type(self).expires_at - time.time()))
             self.send_response(303)
             self.send_header("Location", "/")
@@ -135,6 +154,7 @@ class TemporaryTransferHandler(WebFileHandler):
             self.end_headers()
             LOGGER.info("临时传输登录成功: %s", self.address_string())
         else:
+            LOGIN_LIMITER.record_failure(client_key)
             LOGGER.warning("临时传输访问码错误: %s", self.address_string())
             self.serve_login("访问码错误，请重试")
 

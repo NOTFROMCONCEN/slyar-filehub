@@ -28,6 +28,8 @@ DAV_NS = "DAV:"
 LOCK_TIMEOUT_DEFAULT = 600
 LOCK_TIMEOUT_MAX = 3600
 MAX_PROPFIND_ENTRIES = 50000
+PROPFIND_TIME_BUDGET = 15
+MAX_WEBDAV_CONNECTIONS = 64
 LOCK_TOKEN_RE = re.compile(r"<(opaquelocktoken:[^>]+|urn:uuid:[^>]+)>")
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
@@ -126,6 +128,19 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         LOGGER.info("%s - %s", self.address_string(), fmt % args)
 
+    def handle_one_request(self):
+        self._headers_sent = False
+        super().handle_one_request()
+
+    def end_headers(self):
+        self._headers_sent = True
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        super().end_headers()
+
+    def _response_started(self):
+        return getattr(self, "_headers_sent", False)
+
     def _can(self, action, default=False):
         return bool(self.permissions.get(action, default))
 
@@ -146,6 +161,10 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         self._send_empty(401, {"WWW-Authenticate": 'Basic realm="Slyar WebDAV"'})
 
     def _send_empty(self, status, extra=None):
+        if self._response_started():
+            # 流式响应已发出，不能再写第二个 HTTP 响应
+            self.close_connection = True
+            return
         self.send_response(status)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
@@ -153,6 +172,9 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_bytes(self, status, body, content_type, extra=None):
+        if self._response_started():
+            self.close_connection = True
+            return
         self.send_response(status)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
@@ -480,7 +502,10 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         if depth not in ("0", "1", "infinity"):
             depth = "infinity"
         entries = []
-        self._collect_props(target, rel, depth, entries)
+        self._collect_props(
+            target, rel, depth, entries,
+            deadline=time.monotonic() + PROPFIND_TIME_BUDGET,
+        )
         body = (
             '<?xml version="1.0" encoding="utf-8"?>'
             f'<D:multistatus xmlns:D="{DAV_NS}">' + "".join(entries) + "</D:multistatus>"
@@ -489,8 +514,10 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
             207, body, 'application/xml; charset="utf-8"'
         )
 
-    def _collect_props(self, target, rel, depth, entries):
+    def _collect_props(self, target, rel, depth, entries, deadline=None):
         if len(entries) >= MAX_PROPFIND_ENTRIES:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
             return
         entries.append(self._prop_response(rel, target))
         if os.path.isdir(target) and not os.path.islink(target) and depth in ("1", "infinity"):
@@ -503,9 +530,12 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
             for entry in children:
                 if len(entries) >= MAX_PROPFIND_ENTRIES:
                     return
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
                 child_rel = rel.rstrip("/") + "/" + entry.name
                 self._collect_props(
-                    os.path.join(target, entry.name), child_rel, child_depth, entries
+                    os.path.join(target, entry.name), child_rel, child_depth,
+                    entries, deadline=deadline,
                 )
 
     def _prop_response(self, rel, target):
@@ -654,6 +684,9 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         self._send_lock_response(lock, new=True)
 
     def _send_lock_response(self, lock, new):
+        if self._response_started():
+            self.close_connection = True
+            return
         timeout = max(1, min(int(lock["expires"] - time.time()), LOCK_TIMEOUT_MAX))
         body = (
             '<?xml version="1.0" encoding="utf-8"?>'
@@ -701,15 +734,53 @@ def make_webdav_handler(root, username, password, permissions=None):
     )
 
 
+class _LimitedThreadingHTTPServer(ThreadingHTTPServer):
+    """给 WebDAV 加并发上限（阈值宽松，正常客户端无感）。"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_WEBDAV_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class WebDAVService:
     """线程化 WebDAV 服务，接口与 SFTPService 保持一致。"""
 
-    def __init__(self, port, username, password, directory, permissions=None):
+    def __init__(self, port, username, password, directory, permissions=None,
+                 bind_address=""):
         self.port = port
         self.username = username
         self.password = password
         self.directory = directory
         self.permissions = permissions or {}
+        # 空字符串 = 监听全部网卡（原有行为）
+        self.bind_address = bind_address or ""
         self.server = None
         self.thread = None
         self.stopped = threading.Event()
@@ -727,7 +798,9 @@ class WebDAVService:
             self.directory, self.username, self.password, self.permissions
         )
         try:
-            self.server = ThreadingHTTPServer(("", self.port), handler)
+            self.server = _LimitedThreadingHTTPServer(
+                (self.bind_address, self.port), handler
+            )
         except OSError as exc:
             if getattr(exc, "winerror", None) == 10048:
                 raise OSError(

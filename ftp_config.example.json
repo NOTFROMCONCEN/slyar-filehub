@@ -8,6 +8,7 @@
   "enable_webdav": false,
   "web_password": "",
   "web_readonly": false,
+  "bind_address": "",
   "max_connections": "100",
   "username": "yourname",
   "password": "changeme",

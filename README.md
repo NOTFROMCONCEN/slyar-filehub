@@ -74,6 +74,24 @@ pip install pyftpdlib psutil paramiko pystray pillow
 
 > 配置说明：首次运行会自动生成 `ftp_config.json` 保存账户和端口设置。该文件包含密码，已在 `.gitignore` 中排除，请勿提交；模板可参考 `ftp_config.example.json`
 
+## 安全默认值与可选加固
+
+> **为保持既有行为，程序默认仍监听全部 IPv4 网卡，Web 访问密码留空即免登录且可写。**
+> 若主机可从公网或不可信网络访问，这等价于开放匿名读写。请先完成下列两项之一。
+
+1. **限制监听范围**：在 `ftp_config.json` 中设置 `"bind_address": "192.168.1.10"`（换成实际局域网网卡地址）。留空或 `0.0.0.0` = 监听全部网卡（原行为）。GUI 与命令行模式都生效，覆盖 FTP / SFTP / Web / WebDAV；临时双向传输仍单独使用所选网卡。
+2. **设置 Web 访问密码**：在「服务选择」的 Web 行填写密码，或把 `web_readonly` 设为 `true`。启动服务时，程序会把「未设密码 / 监听全部网卡」的提示写入日志，但不会强制更改配置。
+
+其余内置加固（均不改变默认行为）：
+
+- 登录失败限速：同一 IP 在 60 秒内失败 10 次后锁定 60 秒（Web 与临时传输共用）
+- 写请求校验 `Origin`，拒绝跨站调用；不带 `Origin` 头的 API / 命令行客户端不受影响
+- Web 新增 `/logout`（设置密码后页面右上角出现退出按钮）；响应统一带 `X-Content-Type-Options`、`X-Frame-Options: SAMEORIGIN`、`Referrer-Policy`
+- 流式响应中途出错不再写出第二个 HTTP 响应；Web 服务启用端口快速复用
+- `web_server.MAX_UPLOAD_BYTES` / `MAX_LIST_ENTRIES`、WebDAV 的 `MAX_WEBDAV_CONNECTIONS` / `PROPFIND_TIME_BUDGET` 为可选上限，默认不限制
+
+配置文件中的账户密码仍为**明文**存储，FTP / Web / WebDAV 仍是明文 HTTP 传输，请勿把 `ftp_config.json` 提交到版本库或放在共享目录中。
+
 ## 打包为EXE
 
 ### 方法一：使用打包脚本（推荐）
@@ -185,7 +203,7 @@ SFTP 首次启动会在用户配置目录保存主机密钥，后续启动沿用
 
 ### 停止服务
 
-点击"停止服务"按钮即可关闭FTP服务器
+点击「停止所有服务」按钮会关闭 FTP / SFTP / Web / WebDAV 以及临时双向传输；从托盘菜单「退出程序」退出时同样会完整清理所有服务并保存配置。启动服务成功后配置也会立即落盘，异常退出不再丢失设置。
 
 ## FTP客户端连接示例
 
@@ -242,7 +260,11 @@ ftp IP地址 端口
 
 ```bash
 python -m pytest tests/ -v
+# 修复项回归（只依赖标准库，无需安装第三方包）：
+python -m unittest tests/test_review_fixes.py -v
 ```
+
+打包相关：`packtoexe.py` 是推荐的单一构建入口，所有清理与命令都锚定到脚本所在目录；`FTP服务器.spec` 供手工 `pyinstaller FTP服务器.spec` 使用，两条路径的参数需保持一致。
 
 ## 常见问题
 

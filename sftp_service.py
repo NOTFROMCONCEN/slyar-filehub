@@ -194,12 +194,15 @@ def _load_host_key():
 
 
 class SFTPService:
-    def __init__(self, port, username, password, directory, permissions=None):
+    def __init__(self, port, username, password, directory, permissions=None,
+                 bind_address=""):
         self.port = port
         self.username = username
         self.password = password
         self.directory = directory
         self.permissions = permissions or {}
+        # 空字符串 = 监听全部网卡（原有行为）
+        self.bind_address = bind_address or ""
         self.host_key = None
         self.listener = None
         self.thread = None
@@ -217,7 +220,7 @@ class SFTPService:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("", self.port))
+            listener.bind((self.bind_address, self.port))
             listener.listen(100)
             listener.settimeout(0.5)
         except Exception:
@@ -277,8 +280,11 @@ class SFTPService:
         finally:
             if transport is not None:
                 transport.close()
-            else:
+            # 显式关闭原始 socket，避免 Transport 未接管时连接泄漏（重复 close 是安全的）
+            try:
                 client.close()
+            except OSError:
+                pass
             with self.lock:
                 self.transports.discard(transport)
             self.slots.release()

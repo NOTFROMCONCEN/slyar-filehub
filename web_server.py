@@ -56,6 +56,66 @@ MAX_ZIP_BYTES = 100 * 1024 ** 3  # 100 GiB；单文件上传/下载不设大小�
 MAX_ZIP_CONCURRENT = 2
 ZIP_SLOTS = threading.BoundedSemaphore(MAX_ZIP_CONCURRENT)
 
+# 可选上限：0 表示不限制，保持既有「单文件不设大小上限 / 整目录一次列出」的行为
+MAX_UPLOAD_BYTES = 0
+MAX_LIST_ENTRIES = 0
+
+
+class LoginRateLimiter:
+    """按来源 IP 限制连续登录失败次数；阈值宽松，正常登录无感。"""
+
+    def __init__(self, max_failures=10, window=60, lockout=60):
+        self.max_failures = max_failures
+        self.window = window
+        self.lockout = lockout
+        self._failures = {}
+        self._blocked_until = {}
+        self._lock = threading.Lock()
+
+    def _purge(self, now):
+        cutoff = now - self.window
+        for key, times in list(self._failures.items()):
+            kept = [t for t in times if t >= cutoff]
+            if kept:
+                self._failures[key] = kept
+            else:
+                self._failures.pop(key, None)
+
+    def allowed(self, key):
+        now = time.monotonic()
+        with self._lock:
+            until = self._blocked_until.get(key, 0)
+            if until > now:
+                return False, int(until - now) + 1
+            if until:
+                self._blocked_until.pop(key, None)
+            self._purge(now)
+            return True, 0
+
+    def record_failure(self, key):
+        now = time.monotonic()
+        with self._lock:
+            self._purge(now)
+            times = self._failures.setdefault(key, [])
+            times.append(now)
+            if self.max_failures > 0 and len(times) >= self.max_failures:
+                self._blocked_until[key] = now + self.lockout
+                self._failures.pop(key, None)
+
+    def record_success(self, key):
+        with self._lock:
+            self._failures.pop(key, None)
+            self._blocked_until.pop(key, None)
+
+    def reset(self):
+        """清空计数（供测试与配置热更新使用）。"""
+        with self._lock:
+            self._failures.clear()
+            self._blocked_until.clear()
+
+
+LOGIN_LIMITER = LoginRateLimiter(10, 60, 60)
+
 
 def sanitize_filename(name):
     """净化文件/目录名：仅保留最后一级名称，替换危险字符，拒绝 . / .. / 空"""
@@ -192,6 +252,34 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         WEB_LOGGER.info("%s - %s", self.address_string(), format % args)
 
+    def handle_one_request(self):
+        # keep-alive 连接会复用同一个 handler 实例，每个请求重置响应状态
+        self._headers_sent = False
+        super().handle_one_request()
+
+    def end_headers(self):
+        # 统一加安全响应头；不启用会拦截内联脚本的 CSP，保持页面功能不变
+        self._headers_sent = True
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")  # 允许同源 PDF iframe 预览
+        self.send_header("Referrer-Policy", "same-origin")
+        super().end_headers()
+
+    def _response_started(self):
+        return getattr(self, "_headers_sent", False)
+
+    def _origin_allowed(self):
+        """只拒绝明确的跨站写请求；无 Origin 头的 API/命令行客户端保持兼容。"""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            origin_host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+        except ValueError:
+            return False
+        host = (self.headers.get("Host") or "").split(":")[0].lower().strip("[]")
+        return bool(origin_host and host and origin_host == host)
+
     def _cookie_session(self):
         m = re.search(r"slyar_session=([A-Za-z0-9_\-]+)", self.headers.get("Cookie", ""))
         token = type(self).session_token
@@ -201,6 +289,10 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
         return not type(self).auth_password or self._cookie_session()
 
     def send_json(self, obj, code=200):
+        if self._response_started():
+            # 响应头已发出（流式接口中途失败）时不能再写第二个响应
+            self.close_connection = True
+            return
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -210,12 +302,18 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_redirect(self, location):
+        if self._response_started():
+            self.close_connection = True
+            return
         self.send_response(303)
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def send_error_page(self, code, message):
+        if self._response_started():
+            self.close_connection = True
+            return
         try:
             body = json.dumps({"ok": False, "error": message}, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
@@ -257,6 +355,17 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
 
             if path == "/favicon.ico":
                 self.send_response(204)
+                self.end_headers()
+                return
+
+            if path == "/logout":
+                self.send_response(303)
+                self.send_header("Location", "/login")
+                self.send_header(
+                    "Set-Cookie",
+                    "slyar_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                )
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
 
@@ -311,6 +420,11 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
 
             if not self._authorized():
                 self.send_error_page(401, "需要登录")
+                return
+
+            if path in self.WRITE_ROUTES and not self._origin_allowed():
+                WEB_LOGGER.warning("拒绝跨站写请求 %s: %s", self.address_string(), path)
+                self.send_error_page(403, "跨站请求被拒绝")
                 return
 
             if path in self.WRITE_ROUTES and type(self).readonly:
@@ -369,14 +483,30 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_login(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if length <= 0 or length > 4096:
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            self.close_connection = True
             self.send_redirect("/login?e=1")
+            return
+        if length <= 0 or length > 4096:
+            self.close_connection = True
+            self.send_redirect("/login?e=1")
+            return
+        client_key = (
+            self.client_address[0] if self.client_address else "?", "web"
+        )
+        allowed, wait = LOGIN_LIMITER.allowed(client_key)
+        if not allowed:
+            self.close_connection = True
+            WEB_LOGGER.warning("Web 登录尝试过多: %s", self.address_string())
+            self.serve_login(f"尝试次数过多，请 {wait} 秒后重试")
             return
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "ignore"))
         password = (fields.get("password") or [""])[0]
         expected = type(self).auth_password or ""
         if password and hmac.compare_digest(password.encode(), expected.encode()):
+            LOGIN_LIMITER.record_success(client_key)
             WEB_LOGGER.info("Web 登录成功: %s", self.address_string())
             self.send_response(303)
             self.send_header("Location", "/")
@@ -387,6 +517,7 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
         else:
+            LOGIN_LIMITER.record_failure(client_key)
             WEB_LOGGER.warning("Web 登录失败: %s", self.address_string())
             self.serve_login("密码错误，请重试")
 
@@ -413,7 +544,11 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_page(404, "目录不存在")
             return
         items = []
+        truncated = False
         for name in os.listdir(target):
+            if MAX_LIST_ENTRIES and len(items) >= MAX_LIST_ENTRIES:
+                truncated = True
+                break
             full = os.path.join(target, name)
             try:
                 st = os.stat(full)
@@ -433,6 +568,7 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
                 "ok": True,
                 "path": rel.replace("\\", "/"),
                 "items": items,
+                "truncated": truncated,
                 "readonly": type(self).readonly,
                 "auth": bool(type(self).auth_password),
             }
@@ -600,7 +736,6 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("ETag", etag)
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("X-Content-Type-Options", "nosniff")
         if start is None:
             self.send_header("Content-Length", str(size))
         else:
@@ -697,6 +832,9 @@ class WebFileHandler(http.server.BaseHTTPRequestHandler):
     def api_upload(self, content_length):
         # 上传结束后关闭连接，避免未读完的 multipart 尾部污染下一个请求。
         self.close_connection = True
+        if MAX_UPLOAD_BYTES and content_length > MAX_UPLOAD_BYTES:
+            self.send_error_page(413, "上传体积超过服务器上限")
+            return
         content_type = self.headers.get("Content-Type", "")
         m = re.search(r'boundary="?([^";]+)"?', content_type)
         if not content_type.startswith("multipart/form-data") or not m:
@@ -872,7 +1010,8 @@ class ThreadedWebServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     """线程化Web服务器：并发处理浏览器请求，避免单线程排队卡死"""
 
     daemon_threads = True
-    allow_reuse_address = False
+    # 与 SFTP / WebDAV 保持一致，避免停止后同端口立即重启在 Linux/macOS 上 EADDRINUSE
+    allow_reuse_address = True
     request_queue_size = 128
 
     def handle_error(self, request, client_address):
@@ -1360,6 +1499,7 @@ textarea.text-input{resize:vertical;font-family:inherit;line-height:1.5}
     <div class="spacer"></div>
     <button id="viewBtn" class="icon-btn" title="切换列表/网格视图" aria-label="切换列表或网格视图">▦</button>
     <button id="themeBtn" class="icon-btn" title="切换明暗主题" aria-label="切换明暗主题">☾</button>
+    <a id="logoutBtn" class="icon-btn" href="/logout" title="退出登录" aria-label="退出登录" hidden>⏻</a>
   </div>
 </header>
 <section class="workspace-head">
@@ -1500,6 +1640,8 @@ async function load() {
     const data = await api("/api/list?path=" + encodeURIComponent(state.path));
     state.items = data.items || [];
     state.readonly = !!data.readonly;
+    const logoutBtn = $("#logoutBtn");
+    if (logoutBtn) logoutBtn.hidden = !data.auth;
     applyReadonlyUI();
   } catch (e) {
     toast(e.message, "error");

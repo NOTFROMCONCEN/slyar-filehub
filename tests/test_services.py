@@ -13,11 +13,18 @@ import threading
 import unittest
 from unittest import mock
 
-import paramiko
+try:
+    import paramiko
+    from sftp_service import SFTPService
+
+    PARAMIKO_AVAILABLE = True
+except ImportError:  # SFTP 在运行时是可选依赖，测试不应因缺依赖而无法收集
+    paramiko = None
+    SFTPService = None
+    PARAMIKO_AVAILABLE = False
 
 from config_manager import ConfigManager, ftp_permissions_from_config
 from ftp_server_gui import FTPServerGUI, HeadlessServer
-from sftp_service import SFTPService
 from web_server import ThreadedWebServer, make_web_handler, safe_join
 from webdav_service import WebDAVService
 
@@ -127,6 +134,7 @@ class TransferServiceTests(unittest.TestCase):
         app.quit_program.assert_called_once_with()
         app.root.withdraw.assert_not_called()
 
+    @unittest.skipUnless(PARAMIKO_AVAILABLE, "未安装 paramiko，跳过 SFTP 用例")
     def test_sftp_transfer_permissions_and_stop(self):
         with tempfile.TemporaryDirectory() as folder:
             root = pathlib.Path(folder)

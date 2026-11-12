@@ -10,6 +10,10 @@ import sys
 import subprocess
 import shutil
 
+# 所有清理、数据文件与构建命令都以脚本所在目录为基准，
+# 避免从其他工作目录执行时误删同名的 build/dist/__pycache__。
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 def check_pyinstaller():
     """检查PyInstaller是否已安装"""
@@ -36,20 +40,23 @@ def install_pyinstaller():
 
 
 def clean_build():
-    """清理之前的构建文件"""
+    """清理之前的构建文件（仅限本项目目录内）"""
     dirs_to_remove = ["build", "dist", "__pycache__"]
+    # 只清理由 PyInstaller 命令行自动生成的 spec；项目自带的 FTP服务器.spec 必须保留
     files_to_remove = ["ftp_server_gui.spec"]
 
     print("\n清理旧的构建文件...")
-    for dir_name in dirs_to_remove:
-        if os.path.exists(dir_name):
-            shutil.rmtree(dir_name)
-            print(f"  已删除: {dir_name}/")
+    for name in dirs_to_remove:
+        target = os.path.join(PROJECT_DIR, name)
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+            print(f"  已删除: {name}/")
 
-    for file_name in files_to_remove:
-        if os.path.exists(file_name):
-            os.remove(file_name)
-            print(f"  已删除: {file_name}")
+    for name in files_to_remove:
+        target = os.path.join(PROJECT_DIR, name)
+        if os.path.isfile(target):
+            os.remove(target)
+            print(f"  已删除: {name}")
 
 
 def create_version_file():
@@ -87,9 +94,22 @@ VSVersionInfo(
   ]
 )
 """
-    with open("version.txt", "w", encoding="utf-8") as f:
+    version_path = os.path.join(PROJECT_DIR, "version.txt")
+    with open(version_path, "w", encoding="utf-8") as f:
         f.write(version_info)
     print("✓ 版本信息文件已创建")
+    return version_path
+
+
+def version_args():
+    """生成版本资源参数；生成失败时跳过，绝不让构建因此中断。"""
+    if os.name != "nt":
+        return []
+    try:
+        return ["--version-file", create_version_file()]
+    except Exception as e:
+        print(f"  跳过版本信息: {e}")
+        return []
 
 
 def pack_onefile():
@@ -118,13 +138,14 @@ def pack_onefile():
         "pystray._win32",  # pystray动态加载的Windows后端
         "--hidden-import",
         "pystray._util.win32",
+        *version_args(),
         "ftp_server_gui.py",  # 主程序
     ]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, cwd=PROJECT_DIR)
         print("\n✓ 单文件打包成功！")
-        print(f"✓ 输出位置: {os.path.abspath('dist/FTP服务器.exe')}")
+        print(f"✓ 输出位置: {os.path.join(PROJECT_DIR, 'dist', 'FTP服务器.exe')}")
         return True
     except subprocess.CalledProcessError as e:
         print(f"\n✗ 打包失败: {e}")
@@ -157,13 +178,14 @@ def pack_onedir():
         "pystray._win32",  # pystray动态加载的Windows后端
         "--hidden-import",
         "pystray._util.win32",
+        *version_args(),
         "ftp_server_gui.py",  # 主程序
     ]
 
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, cwd=PROJECT_DIR)
         print("\n✓ 单目录打包成功！")
-        print(f"✓ 输出位置: {os.path.abspath('dist/FTP服务器/')}")
+        print(f"✓ 输出位置: {os.path.join(PROJECT_DIR, 'dist', 'FTP服务器')}")
         return True
     except subprocess.CalledProcessError as e:
         print(f"\n✗ 打包失败: {e}")
@@ -227,9 +249,10 @@ def main():
     print("打包完成！")
     print("=" * 60)
 
-    if os.path.exists("dist"):
+    dist_dir = os.path.join(PROJECT_DIR, "dist")
+    if os.path.isdir(dist_dir):
         print("\n生成的文件位于 dist 目录：")
-        for item in os.listdir("dist"):
+        for item in os.listdir(dist_dir):
             print(f"  - {item}")
 
     print("\n提示：")

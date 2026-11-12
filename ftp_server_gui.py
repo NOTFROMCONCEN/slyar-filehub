@@ -15,7 +15,13 @@ import urllib.parse
 import argparse
 import secrets
 import time
-from config_manager import ConfigManager, ftp_permissions_from_config
+from config_manager import (
+    ConfigManager,
+    ftp_permissions_from_config,
+    normalize_ports,
+    security_warnings,
+    validate_service_config,
+)
 from tray_manager import TrayManager, TRAY_AVAILABLE
 from web_server import ThreadedWebServer, make_web_handler
 from temporary_transfer import make_temporary_transfer_handler
@@ -33,6 +39,7 @@ except ImportError:
 import logging
 import datetime
 import queue
+from logging.handlers import RotatingFileHandler
 from threading import Lock
 
 
@@ -198,31 +205,46 @@ class FTPServerGUI:
                 self.log_warning("托盘不可用，已显示主窗口以便管理服务和退出")
 
     def setup_logging(self):
-        """设置日志系统"""
-        # 创建日志目录
+        """设置日志系统（幂等，且所有服务模块的日志都进 GUI 队列）"""
         log_dir = "logs"
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-
-        # 配置日志文件
         log_file = os.path.join(
             log_dir, f"ftp_server_{datetime.datetime.now().strftime('%Y%m%d')}.log"
         )
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
 
-        # 配置logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[
-                logging.FileHandler(log_file, encoding="utf-8"),
-                logging.StreamHandler(),
-            ],
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
+                file_handler = RotatingFileHandler(
+                    log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+                )
+                file_handler.setFormatter(formatter)
+                root_logger.addHandler(file_handler)
+        except OSError as e:
+            print(f"日志文件初始化失败: {e}")
+
+        if not any(
+            isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+            for h in root_logger.handlers
+        ):
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(formatter)
+            root_logger.addHandler(stream_handler)
+
+        # 挂在 root 上才能收到 WebServer / WebDAV / TemporaryTransfer 等子 logger 的记录
+        queue_handler = next(
+            (h for h in root_logger.handlers if isinstance(h, LogHandler)), None
         )
+        if queue_handler is None:
+            self.log_handler = LogHandler(self.log_queue)
+            root_logger.addHandler(self.log_handler)
+        else:
+            self.log_handler = queue_handler
+            self.log_handler.log_queue = self.log_queue
 
-        # 创建自定义日志处理器
         self.logger = logging.getLogger("FTPServer")
-        self.log_handler = LogHandler(self.log_queue)
-        self.logger.addHandler(self.log_handler)
 
         # 记录启动日志
         self.log_info("Slyar FTP Server 启动")
@@ -314,14 +336,14 @@ class FTPServerGUI:
                 dpi = user32.GetDpiForSystem()
                 scale_factor = dpi / 96.0
                 self.root.tk.call("tk", "scaling", scale_factor)
-            except:
+            except Exception:
                 # 备用方案
                 self.root.tk.call("tk", "scaling", 1.25)
-        except:
+        except Exception:
             try:
                 # 通用缩放设置
                 self.root.tk.call("tk", "scaling", 1.2)
-            except:
+            except Exception:
                 pass
 
         # 配置字体抗锯齿
@@ -330,7 +352,7 @@ class FTPServerGUI:
             self.root.tk.call(
                 "tk", "font", "configure", self.style.FONT_FAMILY, "-antialias", "true"
             )
-        except:
+        except Exception:
             pass
 
     def setup_theme(self):
@@ -1806,7 +1828,7 @@ class FTPServerGUI:
                 s.connect(("8.8.8.8", 80))
                 primary_ip = s.getsockname()[0]
                 s.close()
-            except:
+            except Exception:
                 pass
 
             # 使用psutil获取所有网卡信息
@@ -1859,7 +1881,7 @@ class FTPServerGUI:
                         "is_loopback": False,
                     }
                 )
-            except:
+            except Exception:
                 pass
 
             # 添加回环地址
@@ -2019,7 +2041,7 @@ class FTPServerGUI:
         """检查是否具有管理员权限"""
         try:
             return ctypes.windll.shell32.IsUserAnAdmin()
-        except:
+        except Exception:
             return False
 
     def show_help(self):
@@ -2456,6 +2478,8 @@ A:
             directory = self.directory_entry.get()
             welcome_msg = self.welcome_entry.get()
             goodbye_msg = self.goodbye_entry.get()
+            raw_bind = getattr(self, "bind_address", "")
+            bind_address = raw_bind.strip() if isinstance(raw_bind, str) else ""
 
             if (self.enable_ftp.get() or self.enable_sftp.get() or self.enable_webdav.get()) and (
                 not username.strip() or not password or username.lower() == "anonymous"
@@ -2526,6 +2550,45 @@ A:
                     messagebox.showerror("错误", "WebDAV端口必须是 1-65535 之间的数字！")
                     return
 
+            # 端口冲突前置校验：避免启动到一半才失败，再触发中途回滚
+            services_to_start = {
+                "ftp": self.enable_ftp.get(),
+                "sftp": self.enable_sftp.get(),
+                "web": self.enable_web.get(),
+                "webdav": self.enable_webdav.get(),
+            }
+            planned_ports = []
+            if services_to_start["ftp"]:
+                planned_ports.append(("FTP", port))
+            if services_to_start["sftp"]:
+                planned_ports.append(("SFTP", port + 1))
+            if services_to_start["web"]:
+                planned_ports.append(("Web", web_port))
+            if services_to_start["webdav"]:
+                planned_ports.append(("WebDAV", webdav_port))
+            seen_ports = {}
+            for label, value in planned_ports:
+                if value in seen_ports:
+                    messagebox.showerror(
+                        "错误",
+                        f"{label} 与 {seen_ports[value]} 端口冲突（均为 {value}），请修改端口",
+                    )
+                    return
+                seen_ports[value] = label
+
+            config_snapshot = {
+                "ftp_port": self.ftp_port_entry.get(),
+                "web_port": self.web_port_entry.get(),
+                "webdav_port": self.webdav_port_entry.get(),
+                "max_connections": self.max_conn_entry.get(),
+                "username": username,
+                "password": password,
+                "directory": directory,
+                "web_password": self.web_password_entry.get(),
+                "web_readonly": self.web_readonly_var.get(),
+                "bind_address": getattr(self, "bind_address", ""),
+            }
+
             # 检查端口权限
             if (
                 port is not None
@@ -2569,7 +2632,7 @@ A:
                     handler.banner = welcome_msg
 
                     # 创建服务器
-                    self.ftp_server = FTPServer(("0.0.0.0", port), handler)
+                    self.ftp_server = FTPServer((bind_address or "0.0.0.0", port), handler)
                     self.ftp_server.max_cons = max_conn
                     self.ftp_server.max_cons_per_ip = max_conn
 
@@ -2598,7 +2661,7 @@ A:
                     success_messages.append(f"SFTP服务已启动在端口 {port + 1}")
                 except Exception as e:
                     if self.ftp_running:
-                        self.stop_all_services(notify=False)
+                        self._rollback_services()
                     messagebox.showerror("错误", f"启动SFTP服务失败：{str(e)}")
                     return
 
@@ -2615,7 +2678,7 @@ A:
                     success_messages.append(f"Web服务已启动在端口 {web_port}")
                 except Exception as e:
                     if self.ftp_running or self.sftp_running:
-                        self.stop_all_services(notify=False)
+                        self._rollback_services()
                     messagebox.showerror("错误", f"启动Web服务失败：{str(e)}")
                     return
 
@@ -2633,7 +2696,7 @@ A:
                     success_messages.append(f"WebDAV服务已启动在端口 {webdav_port}")
                 except Exception as e:
                     if self.ftp_running or self.sftp_running or self.web_running:
-                        self.stop_all_services(notify=False)
+                        self._rollback_services()
                     messagebox.showerror("错误", f"启动WebDAV服务失败：{str(e)}")
                     return
 
@@ -2648,8 +2711,59 @@ A:
             for msg in success_messages:
                 self.log_info(msg)
 
+            # 启动成功后立即落盘：异常退出不再丢失配置（正常退出时仍会再保存一次）
+            self.save_config()
+            # 不改变默认行为，只在日志中提示当前暴露面
+            for warning in security_warnings(config_snapshot, services_to_start):
+                self.log_warning(warning)
+
         except Exception as e:
             messagebox.showerror("错误", f"启动服务失败：{str(e)}")
+
+    def _rollback_services(self):
+        """启动失败时只回收本次已启动的常驻服务，不影响临时双向传输与其端口记录。"""
+        for key in ("ftp", "sftp", "web", "webdav"):
+            self._service_ports.pop(key, None)
+
+        if self.ftp_running and self.ftp_server:
+            try:
+                self.ftp_server.close_all()
+            except Exception as e:
+                self.log_error(f"回滚 FTP 服务失败：{e}")
+            self.ftp_running = False
+            self.ftp_server = None
+
+        if self.sftp_running and self.sftp_server:
+            try:
+                self.sftp_server.stop()
+            except Exception as e:
+                self.log_error(f"回滚 SFTP 服务失败：{e}")
+            self.sftp_running = False
+            self.sftp_server = None
+
+        if self.web_running and self.web_server:
+            try:
+                self.web_server.shutdown()
+                self.web_server.server_close()
+            except Exception as e:
+                self.log_error(f"回滚 Web 服务失败：{e}")
+            self.web_running = False
+            self.web_server = None
+
+        if self.webdav_running and self.webdav_server:
+            try:
+                self.webdav_server.stop()
+            except Exception as e:
+                self.log_error(f"回滚 WebDAV 服务失败：{e}")
+            self.webdav_running = False
+            self.webdav_server = None
+
+        try:
+            self.start_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.DISABLED)
+            self.web_button.config(state=tk.DISABLED)
+        except Exception:
+            pass
 
     def stop_all_services(self, notify=True):
         """停止所有服务"""
@@ -2714,10 +2828,15 @@ A:
             messagebox.showerror("错误", f"停止服务失败：{str(e)}")
 
     def start_sftp_server(self, port, username, password, directory, permissions=None):
-        """启动真实的 SFTP 子系统，监听全部 IPv4 网卡。"""
+        """启动真实的 SFTP 子系统；bind_address 为空时沿用监听全部网卡的行为。"""
         if not SFTP_AVAILABLE:
             raise RuntimeError("SFTP 服务不可用，请安装 paramiko")
-        service = SFTPService(port, username, password, directory, permissions)
+        raw_bind = getattr(self, "bind_address", "")
+        bind_address = raw_bind.strip() if isinstance(raw_bind, str) else ""
+        service = SFTPService(
+            port, username, password, directory, permissions,
+            bind_address=bind_address,
+        )
         service.start()
         self.sftp_server = service
         self.sftp_thread = service.thread
@@ -2728,9 +2847,11 @@ A:
         # 创建绑定共享目录的请求处理器
         handler = make_web_handler(directory, password=password, readonly=readonly)
 
-        # 创建服务器
+        # 创建服务器（bind_address 为空时保持监听全部网卡）
+        raw_bind = getattr(self, "bind_address", "")
+        bind_address = raw_bind.strip() if isinstance(raw_bind, str) else ""
         try:
-            self.web_server = ThreadedWebServer(("", port), handler)
+            self.web_server = ThreadedWebServer((bind_address, port), handler)
         except OSError as e:
             if getattr(e, "winerror", None) == 10048:
                 raise OSError(
@@ -2745,8 +2866,13 @@ A:
         self.web_running = True
 
     def start_webdav_server(self, port, username, password, directory, permissions=None):
-        """启动 WebDAV 服务，监听全部 IPv4 网卡。"""
-        service = WebDAVService(port, username, password, directory, permissions)
+        """启动 WebDAV 服务；bind_address 为空时沿用监听全部网卡的行为。"""
+        raw_bind = getattr(self, "bind_address", "")
+        bind_address = raw_bind.strip() if isinstance(raw_bind, str) else ""
+        service = WebDAVService(
+            port, username, password, directory, permissions,
+            bind_address=bind_address,
+        )
         service.start()
         self.webdav_server = service
         self.webdav_thread = service.thread
@@ -2756,7 +2882,11 @@ A:
         """打开Web管理界面"""
         if self.web_running:
             web_port = self.web_port_entry.get()
-            webbrowser.open(f"http://127.0.0.1:{web_port}")
+            raw_bind = getattr(self, "bind_address", "")
+            host = raw_bind.strip() if isinstance(raw_bind, str) else ""
+            if host in ("", "0.0.0.0", "::"):
+                host = "127.0.0.1"
+            webbrowser.open(f"http://{host}:{web_port}")
         else:
             messagebox.showerror("错误", "Web服务未启动！")
 
@@ -2788,6 +2918,8 @@ A:
         self.web_password_entry.delete(0, tk.END)
         self.web_password_entry.insert(0, config.get("web_password", ""))
         self.web_readonly_var.set(bool(config.get("web_readonly", False)))
+        # 可选绑定地址；缺省为空 = 沿用原有的监听全部网卡行为
+        self.bind_address = str(config.get("bind_address", "") or "").strip()
 
         # 加载服务选择配置
         self.enable_ftp.set(config.get("enable_ftp", True))
@@ -2844,6 +2976,7 @@ A:
             # Web安全配置
             "web_password": self.web_password_entry.get(),
             "web_readonly": self.web_readonly_var.get(),
+            "bind_address": getattr(self, "bind_address", ""),
             # 保持向后兼容的配置
             "port": self.ftp_port_entry.get(),  # 为了向后兼容
             "max_connections": self.max_conn_entry.get(),
@@ -3004,7 +3137,7 @@ A:
                     log_text_widget.config(state=tk.DISABLED)
                     # 滚动到底部
                     log_text_widget.see(tk.END)
-            except:
+            except Exception:
                 pass
 
             # 如果窗口还存在，继续更新
@@ -3056,9 +3189,15 @@ A:
         if getattr(self, "tray", None):
             self.tray.stop()
 
-        # 停止所有服务
+        # 退出时必须停止全部服务（含 WebDAV 与临时传输），这里不能用只回收常驻服务的回滚
         if any(
-            [self.ftp_running, self.sftp_running, self.web_running, self.temp_transfer_running]
+            [
+                self.ftp_running,
+                self.sftp_running,
+                self.web_running,
+                self.webdav_running,
+                self.temp_transfer_running,
+            ]
         ):
             self.stop_all_services(notify=False)
 
@@ -3112,7 +3251,9 @@ class HeadlessServer:
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s - %(message)s",
             handlers=[
-                logging.FileHandler(log_file, encoding="utf-8"),
+                RotatingFileHandler(
+                    log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+                ),
                 logging.StreamHandler(),
             ],
         )
@@ -3143,6 +3284,7 @@ class HeadlessServer:
         directory=os.path.expanduser("~"),
         welcome_msg="欢迎访问 Slyar FTP Server!",
         permissions=None,
+        bind_address="",
     ):
         """启动FTP服务"""
         try:
@@ -3159,7 +3301,7 @@ class HeadlessServer:
             handler.banner = welcome_msg
 
             # 创建服务器
-            self.ftp_server = FTPServer(("0.0.0.0", port), handler)
+            self.ftp_server = FTPServer((bind_address or "0.0.0.0", port), handler)
             self.ftp_server.max_cons = max_conn
             self.ftp_server.max_cons_per_ip = max_conn
 
@@ -3178,13 +3320,17 @@ class HeadlessServer:
     def start_sftp_service(
         self, port=22, username="qwe", password="",
         directory=os.path.expanduser("~"), permissions=None,
+        bind_address="",
     ):
         """启动 SFTP 服务，启动失败时不报告成功。"""
         if not SFTP_AVAILABLE:
             self.log_error("SFTP 服务不可用，请安装 paramiko")
             return False
         try:
-            service = SFTPService(port, username, password, directory, permissions)
+            service = SFTPService(
+                port, username, password, directory, permissions,
+                bind_address=bind_address,
+            )
             service.start()
             self.sftp_server = service
             self.sftp_thread = service.thread
@@ -3201,6 +3347,7 @@ class HeadlessServer:
         directory=os.path.expanduser("~"),
         password="",
         readonly=False,
+        bind_address="",
     ):
         """启动Web服务"""
         try:
@@ -3208,7 +3355,7 @@ class HeadlessServer:
             handler = make_web_handler(directory, password=password, readonly=readonly)
 
             # 创建服务器
-            self.web_server = ThreadedWebServer(("", port), handler)
+            self.web_server = ThreadedWebServer((bind_address, port), handler)
 
             # 在新线程中启动服务器
             self.web_thread = threading.Thread(target=self.web_server.serve_forever)
@@ -3228,10 +3375,14 @@ class HeadlessServer:
         password="",
         directory=os.path.expanduser("~"),
         permissions=None,
+        bind_address="",
     ):
         """启动 WebDAV 服务，启动失败时不报告成功。"""
         try:
-            service = WebDAVService(port, username, password, directory, permissions)
+            service = WebDAVService(
+                port, username, password, directory, permissions,
+                bind_address=bind_address,
+            )
             service.start()
             self.webdav_server = service
             self.webdav_thread = service.thread
@@ -3287,19 +3438,32 @@ class HeadlessServer:
             ip = s.getsockname()[0]
             s.close()
             return ip
-        except:
+        except Exception:
             return "127.0.0.1"
 
 
-def _acquire_single_instance():
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _acquire_single_instance(name="SlyarFTPServer_SingleInstance"):
     """Windows下用命名互斥体防止重复启动（后台常驻+开机自启动场景容易重复打开）"""
+    global _SINGLE_INSTANCE_MUTEX
     if sys.platform != "win32":
         return True
     try:
-        ctypes.windll.kernel32.CreateMutexW(
-            None, False, "SlyarFTPServer_SingleInstance"
+        # use_last_error 让 ctypes 在调用后立即保存 GetLastError，
+        # 避免后续 Python 层调用把错误码覆盖掉。
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p,
         )
-        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True
+        # 句柄必须保持引用：句柄关闭后互斥体即被销毁，重复启动检测会失效
+        _SINGLE_INSTANCE_MUTEX = handle
+        return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
     except Exception:
         return True
 
@@ -3318,9 +3482,14 @@ def _warn_already_running():
 
 def main():
     """主函数，支持命令行参数"""
-    # 打包运行时切换到exe所在目录，保证配置、日志路径与开机自启动时一致
+    # 固定到程序所在目录，保证配置、日志路径在正常启动与开机自启动时一致
     if getattr(sys, "frozen", False):
         os.chdir(os.path.dirname(sys.executable))
+    else:
+        try:
+            os.chdir(os.path.dirname(os.path.abspath(__file__)))
+        except OSError:
+            pass
 
     parser = argparse.ArgumentParser(
         description="Slyar FTP Server - 现代化FTP服务器管理工具",
@@ -3370,14 +3539,17 @@ def main():
     config = server.load_config()
 
     # 获取配置参数
-    ftp_port = int(config.get("ftp_port", 21))
-    web_port = int(config.get("web_port", 8080))
-    webdav_port = int(config.get("webdav_port", 5005))
-    max_conn = int(config.get("max_connections", 100))
+    # 端口值统一容错，避免配置中手写了空值/非数字时命令行直接崩溃
+    ports = normalize_ports(config)
+    ftp_port = ports["ftp_port"]
+    web_port = ports["web_port"]
+    webdav_port = ports["webdav_port"]
+    max_conn = ports["max_connections"]
     username = config.get("username", "qwe")
     password = config.get("password", "")
     directory = config.get("directory", os.path.expanduser("~"))
     welcome_msg = config.get("welcome_message", "欢迎访问 Slyar FTP Server!")
+    bind_address = str(config.get("bind_address", "") or "").strip()
 
     # 确定要启动的服务
     start_ftp = args.all or args.ftp
@@ -3385,20 +3557,30 @@ def main():
     start_web = args.all or args.web
     start_webdav = args.all or args.webdav
 
+    # 校验只做提示，不中断启动：保持命令行原有的「能起几个起几个」行为
+    selected = {
+        "ftp": start_ftp,
+        "sftp": start_sftp,
+        "web": start_web,
+        "webdav": start_webdav,
+    }
+    for item in validate_service_config(config, selected, check_directory=False):
+        server.log_info(f"配置校验提示: {item}")
+
     success_count = 0
 
     # 启动服务
     if start_ftp:
         if server.start_ftp_service(
             ftp_port, max_conn, username, password, directory, welcome_msg,
-            config.get("permissions"),
+            config.get("permissions"), bind_address=bind_address,
         ):
             success_count += 1
 
     if start_sftp:
         if server.start_sftp_service(
             ftp_port + 1, username, password, directory,
-            config.get("permissions"),
+            config.get("permissions"), bind_address=bind_address,
         ):
             success_count += 1
 
@@ -3408,6 +3590,7 @@ def main():
             directory,
             password=str(config.get("web_password", "")),
             readonly=bool(config.get("web_readonly", False)),
+            bind_address=bind_address,
         ):
             success_count += 1
 
@@ -3417,7 +3600,7 @@ def main():
             username,
             password,
             directory,
-            config.get("permissions"),
+            config.get("permissions"), bind_address=bind_address,
         ):
             success_count += 1
 
