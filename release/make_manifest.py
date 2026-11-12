@@ -11,6 +11,7 @@ import hashlib
 import json
 import pathlib
 import re
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 APP = "slyar-filehub"
@@ -52,6 +53,11 @@ def read_version(asset_dir):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
     parser = argparse.ArgumentParser(description="生成发版校验和与 manifest")
     parser.add_argument("--dir", default=str(ROOT / "release" / "dist"))
     args = parser.parse_args()

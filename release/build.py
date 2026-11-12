@@ -39,6 +39,15 @@ EXTRA_DOCS = ("使用指南.md", "新手使用教程.md")
 SEP = ";" if os.name == "nt" else ":"
 
 
+def setup_console():
+    """CI 的 Windows runner 默认 stdout 是 cp1252，中文日志会抛 UnicodeEncodeError。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def read_version():
     return (RELEASE / "VERSION").read_text(encoding="utf-8").strip()
 
@@ -176,6 +185,7 @@ def build_linux_packages(portable_dir, output, version):
 
 
 def main():
+    setup_console()
     parser = argparse.ArgumentParser(description="构建 Slyar FileHub 发版资产")
     parser.add_argument("--target", choices=("windows", "linux"), required=True)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
