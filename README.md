@@ -266,6 +266,38 @@ python -m unittest tests/test_review_fixes.py -v
 
 打包相关：`packtoexe.py` 是推荐的单一构建入口，所有清理与命令都锚定到脚本所在目录；`FTP服务器.spec` 供手工 `pyinstaller FTP服务器.spec` 使用，两条路径的参数需保持一致。
 
+## 发布 Release
+
+版本号统一写在 `release/VERSION`（单一来源）。推 tag 即触发 GitHub Actions 自动构建并发布：
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+# 或在 Actions 页面手动运行 build-and-release（workflow_dispatch）
+```
+
+每个 Release **固定包含 5 个资产**（CI 会逐个校验，缺任一个直接失败，不会发出残缺版本）：
+
+| 资产 | 平台 | 说明 |
+|---|---|---|
+| `slyar-filehub-<版本>-windows-amd64.exe` | Windows | PyInstaller 单文件版，双击即用 |
+| `slyar-filehub-<版本>-windows-amd64-portable.zip` | Windows | 免安装目录版，解压后配置与日志都落在同目录 |
+| `slyar-filehub-<版本>-linux-amd64.deb` | Linux | Debian / Ubuntu 系安装包 |
+| `slyar-filehub-<版本>-linux-amd64.rpm` | Linux | RHEL / Fedora / openSUSE 系安装包 |
+| `slyar-filehub-<版本>-linux-amd64-portable.tar.gz` | Linux | 免安装便携版 |
+
+另附 `SHA256SUMS` 与 `latest.json`（含每个资产的哈希与大小），由 `release/make_manifest.py` 生成。
+
+本地构建（Windows 只能产出前两个，Linux 三个包需要 Linux 环境 + `fpm`）：
+
+```bash
+pip install -r requirements.txt pyinstaller
+python release/build.py --target windows --output release/dist
+python release/make_manifest.py --dir release/dist
+```
+
+Linux 安装包会把程序装到 `/opt/slyar-filehub/`，并提供 `/usr/bin/slyar-filehub` 命令与桌面启动项。GUI 模式需要桌面环境与 Tk；无图形环境可用命令行模式 `slyar-filehub --all` 启动 FTP / SFTP / Web / WebDAV。
+
 ## 常见问题
 
 ### Q: 提示端口被占用？

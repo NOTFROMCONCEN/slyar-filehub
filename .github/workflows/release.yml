@@ -1,0 +1,94 @@
+name: build-and-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows 资产
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: 构建 exe 与便携版 zip
+        run: python release/build.py --target windows --output release/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-windows
+          path: release/dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux 资产
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 系统依赖（Tk / rpm / fpm）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv python3-pip ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+      - name: 构建 deb / rpm / 便携版 tar.gz
+        run: |
+          python3 -m venv --system-site-packages .venv
+          . .venv/bin/activate
+          python -c "import tkinter; print('tkinter ok')"
+          pip install -r requirements.txt pyinstaller
+          python release/build.py --target linux --output release/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-linux
+          path: release/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: 发布 Release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          merge-multiple: true
+          path: release/dist
+      - name: 校验 5 个资产齐全
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=$(tr -d '\r\n' < release/VERSION)
+          for f in \
+            "slyar-filehub-${V}-windows-amd64.exe" \
+            "slyar-filehub-${V}-windows-amd64-portable.zip" \
+            "slyar-filehub-${V}-linux-amd64.deb" \
+            "slyar-filehub-${V}-linux-amd64.rpm" \
+            "slyar-filehub-${V}-linux-amd64-portable.tar.gz"; do
+            if [ ! -f "release/dist/$f" ]; then echo "MISSING: $f"; exit 1; fi
+          done
+          echo "5 个资产齐全 ($V)"
+      - name: 生成 SHA256SUMS 与 latest.json
+        run: python3 release/make_manifest.py --dir release/dist
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=$(tr -d '\r\n' < release/VERSION)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}"; else TAG="v${V}"; fi
+          gh release create "$TAG" release/dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Slyar FileHub ${V}" \
+            --generate-notes

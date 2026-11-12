@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Slyar FileHub
+GenericName=LAN File Transfer Server
+Comment=局域网多协议文件传输工具（FTP / SFTP / Web / WebDAV）
+Exec=/opt/slyar-filehub/slyar-filehub
+Icon=slyar-filehub
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+StartupNotify=true
